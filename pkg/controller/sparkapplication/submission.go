@@ -19,9 +19,12 @@ package sparkapplication
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 
+	"github.com/golang/glog"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/GoogleCloudPlatform/spark-on-k8s-operator/pkg/apis/sparkoperator.k8s.io/v1alpha1"
@@ -50,6 +53,32 @@ func newSubmission(args []string, app *v1alpha1.SparkApplication) *submission {
 	}
 }
 
+func runSparkSubmit(submission *submission) error {
+	sparkHome, present := os.LookupEnv(sparkHomeEnvVar)
+	if !present {
+		glog.Error("SPARK_HOME is not specified")
+	}
+	var command = filepath.Join(sparkHome, "/bin/spark-submit")
+
+	cmd := execCommand(command, submission.args...)
+	glog.Infof("spark-submit arguments: %v", cmd.Args)
+
+	if _, err := cmd.Output(); err != nil {
+		var errorMsg string
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			errorMsg = string(exitErr.Stderr)
+		}
+		// Already Exists. Do nothing.
+		if strings.Contains(errorMsg, podAlreadyExistsErrorCode) {
+			glog.Warningf("trying to resubmit an already submitted SparkApplication %s/%s", submission.namespace, submission.name)
+			return nil
+		}
+		return fmt.Errorf("failed to run spark-submit for SparkApplication %s/%s: %v", submission.namespace, submission.name, err)
+	}
+
+	return nil
+}
+
 func buildSubmissionCommandArgs(app *v1alpha1.SparkApplication) ([]string, error) {
 	var args []string
 	if app.Spec.MainClass != nil {
@@ -64,6 +93,7 @@ func buildSubmissionCommandArgs(app *v1alpha1.SparkApplication) ([]string, error
 	args = append(args, "--deploy-mode", string(app.Spec.Mode))
 	args = append(args, "--conf", fmt.Sprintf("spark.kubernetes.namespace=%s", app.Namespace))
 	args = append(args, "--conf", fmt.Sprintf("spark.app.name=%s", app.Name))
+	args = append(args, "--conf", fmt.Sprintf("spark.kubernetes.driver.pod.name=%s", getDefaultDriverPodName(app)))
 
 	// Add application dependencies.
 	args = append(args, addDependenciesConfOptions(app)...)
@@ -226,14 +256,14 @@ func addDriverConfOptions(app *v1alpha1.SparkApplication) ([]string, error) {
 	driverConfOptions = append(driverConfOptions,
 		fmt.Sprintf("%s%s=%s", config.SparkDriverLabelKeyPrefix, config.SparkAppNameLabel, app.Name))
 	driverConfOptions = append(driverConfOptions,
-		fmt.Sprintf("%s%s=%s", config.SparkDriverLabelKeyPrefix, config.SparkAppIDLabel, app.Status.AppID))
-	driverConfOptions = append(driverConfOptions,
 		fmt.Sprintf("%s%s=%s", config.SparkDriverLabelKeyPrefix, config.LaunchedBySparkOperatorLabel, "true"))
 
+	driverPodName := fmt.Sprintf("%s-driver", app.GetName())
 	if app.Spec.Driver.PodName != nil {
-		driverConfOptions = append(driverConfOptions,
-			fmt.Sprintf("%s=%s", config.SparkDriverPodNameKey, *app.Spec.Driver.PodName))
+		driverPodName = *app.Spec.Driver.PodName
 	}
+	driverConfOptions = append(driverConfOptions,
+		fmt.Sprintf("%s=%s", config.SparkDriverPodNameKey, driverPodName))
 
 	if app.Spec.Driver.Image != nil {
 		driverConfOptions = append(driverConfOptions,
@@ -302,6 +332,12 @@ func addDriverConfOptions(app *v1alpha1.SparkApplication) ([]string, error) {
 	}
 	driverConfOptions = append(driverConfOptions, options...)
 
+	options, err = config.GetDriverTolerationConfOptions(app)
+	if err != nil {
+		return nil, err
+	}
+	driverConfOptions = append(driverConfOptions, options...)
+
 	return driverConfOptions, nil
 }
 
@@ -310,8 +346,6 @@ func addExecutorConfOptions(app *v1alpha1.SparkApplication) ([]string, error) {
 
 	executorConfOptions = append(executorConfOptions,
 		fmt.Sprintf("%s%s=%s", config.SparkExecutorLabelKeyPrefix, config.SparkAppNameLabel, app.Name))
-	executorConfOptions = append(executorConfOptions,
-		fmt.Sprintf("%s%s=%s", config.SparkExecutorLabelKeyPrefix, config.SparkAppIDLabel, app.Status.AppID))
 	executorConfOptions = append(executorConfOptions,
 		fmt.Sprintf("%s%s=%s", config.SparkExecutorLabelKeyPrefix, config.LaunchedBySparkOperatorLabel, "true"))
 
@@ -382,6 +416,12 @@ func addExecutorConfOptions(app *v1alpha1.SparkApplication) ([]string, error) {
 	executorConfOptions = append(executorConfOptions, config.GetExecutorEnvVarConfOptions(app)...)
 
 	options, err := config.GetExecutorVolumeMountConfOptions(app)
+	if err != nil {
+		return nil, err
+	}
+	executorConfOptions = append(executorConfOptions, options...)
+
+	options, err = config.GetExecutorTolerationConfOptions(app)
 	if err != nil {
 		return nil, err
 	}
